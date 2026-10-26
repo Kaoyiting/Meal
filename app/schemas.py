@@ -12,9 +12,9 @@ from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 from enum import Enum
 
-from pydantic import BaseModel, validator, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .models import OrderStatus, SagaStepState
+from .models import OrderStatus, SagaStepState, UserRole
 
 
 # ================================
@@ -42,20 +42,180 @@ class SagaStepStateSchema(str, Enum):
 # 請求模型 (Request Models)
 # ================================
 
+class UserRegisterRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50, pattern=r"^[A-Za-z0-9_.-]+$")
+    password: str = Field(..., min_length=8, max_length=128)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return value.lower()
+
+    @field_validator("password")
+    @classmethod
+    def limit_bcrypt_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 72:
+            raise ValueError("密碼 UTF-8 長度不可超過 72 bytes")
+        return value
+
+
+class UserLoginRequest(BaseModel):
+    username: str = Field(..., min_length=3, max_length=50)
+    password: str = Field(..., min_length=1, max_length=128)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        return value.lower()
+
+
+class UserResponse(BaseModel):
+    id: int
+    username: str
+    role: UserRole
+    is_active: bool
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class AuthTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+
+def _validate_schedule_times(values):
+    for field in ("available_from", "available_until"):
+        value = getattr(values, field)
+        if value is not None and value.utcoffset() is None:
+            raise ValueError(f"{field} 必須包含時區，例如 +08:00")
+
+
+class MenuCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    available_from: Optional[datetime] = None
+    available_until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        _validate_schedule_times(self)
+        if self.available_from and self.available_until and self.available_until <= self.available_from:
+            raise ValueError("available_until 必須晚於 available_from")
+        return self
+
+
+class MenuUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    is_active: Optional[bool] = None
+    available_from: Optional[datetime] = None
+    available_until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_timezone(self):
+        _validate_schedule_times(self)
+        return self
+
+
+class MenuItemCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    category: str = Field(..., min_length=1, max_length=50)
+    price: int = Field(..., gt=0)
+    available_from: Optional[datetime] = None
+    available_until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_period(self):
+        _validate_schedule_times(self)
+        if self.available_from and self.available_until and self.available_until <= self.available_from:
+            raise ValueError("available_until 必須晚於 available_from")
+        return self
+
+
+class MenuItemUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    category: Optional[str] = Field(None, min_length=1, max_length=50)
+    price: Optional[int] = Field(None, gt=0)
+    is_active: Optional[bool] = None
+    available_from: Optional[datetime] = None
+    available_until: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_timezone(self):
+        _validate_schedule_times(self)
+        return self
+
+
+class MenuItemResponse(BaseModel):
+    id: int
+    menu_id: int
+    name: str
+    category: str
+    price: int
+    is_active: bool
+    available_from: Optional[datetime]
+    available_until: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class MenuResponse(BaseModel):
+    id: int
+    name: str
+    is_active: bool
+    available_from: Optional[datetime]
+    available_until: Optional[datetime]
+    created_at: datetime
+    updated_at: datetime
+    items: List[MenuItemResponse] = Field(default_factory=list)
+
+    class Config:
+        from_attributes = True
+
 class OrderItemCreate(BaseModel):
     """建立訂單項目的請求模型"""
     menu_item_id: int = Field(..., gt=0, description="餐點ID，必須大於0")
-    menu_item_name: str = Field(..., min_length=1, max_length=100, description="餐點名稱")
-    unit_price: int = Field(..., gt=0, description="單價(元)")
     quantity: int = Field(..., gt=0, le=99, description="數量，範圍1-99")
 
 
 class OrderCreate(BaseModel):
     """建立訂單的請求模型"""
     menu_id: int = Field(..., gt=0, description="菜單編號")
-    items: List[OrderItemCreate] = Field(..., min_items=1, max_items=20, description="訂購項目清單，最多20項")
-    expected_total: int = Field(..., gt=0, description="前端計算的預期總金額(元)")
+    items: List[OrderItemCreate] = Field(..., min_length=1, max_length=20, description="訂購項目清單，最多20項")
     notes: Optional[str] = Field(None, max_length=500, description="備註，最多500字元")
+
+    @field_validator("items")
+    @classmethod
+    def unique_menu_items(cls, items):
+        item_ids = [item.menu_item_id for item in items]
+        if len(item_ids) != len(set(item_ids)):
+            raise ValueError("同一餐點請合併數量後再送出")
+        return items
+
+
+class InventoryRestockRequest(BaseModel):
+    quantity: int = Field(..., gt=0, le=100_000, description="補入庫存數量")
+
+
+class InventoryStockResponse(BaseModel):
+    menu_item_id: int
+    menu_item_name: str
+    available_quantity: int
+    updated_at: Optional[datetime] = None
+
+
+class InventoryMovementResponse(BaseModel):
+    id: uuid.UUID
+    menu_item_id: int
+    menu_item_name: str
+    quantity_delta: int
+    reason: str
+    order_id: Optional[uuid.UUID] = None
+    created_at: datetime
 
 
 class OrderCancelRequest(BaseModel):

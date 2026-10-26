@@ -1,6 +1,6 @@
 # Order Service Dockerfile - 兩階段建構
 # 第一階段：建構依賴項和編譯環境
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 # 設定工作目錄
 WORKDIR /app
@@ -42,6 +42,7 @@ ENV PATH=/home/appuser/.local/bin:$PATH
 COPY app/ ./app/
 COPY alembic/ ./alembic/
 COPY alembic.ini ./
+COPY create_admin.py ./
 
 # 設定權限
 RUN chown -R appuser:appuser /app
@@ -58,7 +59,7 @@ EXPOSE 8000
 
 # 健康檢查
 HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health')" || exit 1
+    CMD python -c 'import os, urllib.request; urllib.request.urlopen("http://127.0.0.1:" + os.getenv("PORT", "8000") + "/health", timeout=5)' || exit 1
 
-# 啟動命令
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Compose 會先執行 Alembic migration，再啟動 API。
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

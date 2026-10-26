@@ -1,0 +1,13 @@
+<script setup>
+import { ref,computed,onMounted,onBeforeUnmount } from 'vue';
+import { money } from '../lib/cart.js';
+const props=defineProps({order:Object});const emit=defineEmits(['close','cancel']);const dialog=ref(null);
+const statusMap={placed:'已下單',preparing:'製作中',delivered:'已送達',completed:'已完成',cancelled:'已取消'};
+const steps=['placed','preparing','delivered','completed'];
+const canCancel=computed(()=>props.order.canCancel && ['placed','preparing'].includes(props.order.status));
+const activeStep=computed(()=>steps.indexOf(props.order.status));
+const dateText=value=>new Intl.DateTimeFormat('zh-TW',{year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(value));
+onMounted(()=>{dialog.value.showModal();document.body.classList.add('modal-open');});onBeforeUnmount(()=>{dialog.value?.close();document.body.classList.remove('modal-open');});
+function backdrop(event){if(event.target!==dialog.value)return;const r=dialog.value.getBoundingClientRect();if(event.clientX<r.left||event.clientX>r.right||event.clientY<r.top||event.clientY>r.bottom)emit('close');}
+</script>
+<template><Teleport to="body"><dialog ref="dialog" class="order-detail-dialog" aria-labelledby="detail-title" @cancel.prevent="emit('close')" @click="backdrop"><button type="button" class="modal-close" aria-label="關閉" @click="emit('close')">×</button><p class="detail-number">訂單 #{{ order.id }}</p><h2 id="detail-title">{{ order.storeName }}</h2><div class="detail-meta"><span :class="['order-status',order.status]">{{ statusMap[order.status] }}</span><span>{{ dateText(order.createdAt) }}</span></div><ol v-if="order.status!=='cancelled'" class="status-track"><li v-for="(step,index) in steps" :key="step" :class="{done:index<=activeStep,current:index===activeStep}"><span></span><small>{{ statusMap[step] }}</small></li></ol><div v-else class="cancel-note">此訂單已於 {{ dateText(order.updatedAt) }} 取消</div><p v-if="order.notes" class="order-notes"><b>訂單備註</b><br>{{ order.notes }}</p><p v-if="order.cancellationReason" class="order-notes">取消原因：{{ order.cancellationReason }}</p><div class="detail-lines"><div v-for="line in order.items" :key="line.key" class="detail-line"><div><b>{{ line.name }} × {{ line.qty }}</b></div><strong>{{ money(line.unitPrice*line.qty) }}</strong></div></div><div class="total"><span>訂單合計</span><strong>{{ money(order.total) }}</strong></div><p v-if="order.status === 'placed' && !order.canCancel" class="subtle">訂單建立超過 10 分鐘，已無法取消。</p><div class="detail-actions"><button v-if="canCancel" type="button" class="cancel" @click="emit('cancel');emit('close')">取消訂單</button><button type="button" class="primary" @click="emit('close')">關閉</button></div></dialog></Teleport></template>

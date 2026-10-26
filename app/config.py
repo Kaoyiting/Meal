@@ -45,7 +45,13 @@ class Settings(BaseSettings):
     RABBITMQ_QUEUE_PREFIX: str = "order_service"
     
     # === CORS 設定 ===
-    BACKEND_CORS_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
+    BACKEND_CORS_ORIGINS: List[str] = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:8080",
+    ]
+    FRONTEND_URL: Optional[str] = None
     ALLOWED_HOSTS: List[str] = ["localhost", "127.0.0.1"]
     
     # === 日誌設定 ===
@@ -94,6 +100,16 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+
+
+def get_async_database_url(database_url: Optional[str] = None) -> str:
+    """Normalize managed PostgreSQL URLs for SQLAlchemy's asyncpg driver."""
+    url = database_url or get_settings().DATABASE_URL
+    if url.startswith("postgres://"):
+        return "postgresql+asyncpg://" + url.removeprefix("postgres://")
+    if url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + url.removeprefix("postgresql://")
+    return url
 
 
 @lru_cache()

@@ -7,7 +7,10 @@
 # 1. 進入 Order 資料夾
 cd Order
 
-# 2. 啟動服務
+# 2. 套用資料庫 migration（首次啟動或 schema 更新時執行）
+python -m alembic upgrade head
+
+# 3. 啟動服務
 python -m uvicorn app.main:app --reload
 
 # 3. 看到這個就成功了：
@@ -16,13 +19,14 @@ python -m uvicorn app.main:app --reload
 
 ### 第二步：取得登入證明（Token）
 ```bash
-# 生成測試用的登入 token
-python generate_jwt_token.py
+# 先用 /auth/register 建立員工；第一次建立管理員使用互動式 CLI
+python create_admin.py
 
-# 會得到兩個 token：
-# - 一般員工用的
-# - 管理員用的
+# 以已建立帳密登入並取得真實 JWT（會提示輸入帳號密碼）
+python generate_jwt_token.py
 ```
+
+員工註冊固定取得 `employee` 角色；只有 `admin` 角色可執行 `/admin/...` API。管理員與員工請各自登入取得 token。
 
 ---
 
@@ -366,7 +370,7 @@ python generate_jwt_token.py
 
 1. **啟動系統**：`python -m uvicorn app.main:app --reload`
 2. **檢查健康**：訪問 `/health`
-3. **生成 token**：執行 `generate_jwt_token.py`
+3. **取得 token**：分別用員工及管理員帳密登入（`POST /auth/login`）
 4. **建立訂單**：POST `/orders`
 5. **查看訂單**：GET `/orders/history`
 6. **取消訂單**：PUT `/orders/{id}/cancel`（10分鐘內）

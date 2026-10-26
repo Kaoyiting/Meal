@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import declarative_base
 
-from .config import get_settings
+from .config import get_async_database_url, get_settings
 from .exceptions import DatabaseError
 
 logger = logging.getLogger(__name__)
@@ -40,7 +40,7 @@ async def init_database() -> None:
     try:
         # 建立 PostgreSQL 非同步引擎
         engine = create_async_engine(
-            settings.DATABASE_URL,
+            get_async_database_url(settings.DATABASE_URL),
             pool_size=settings.DATABASE_POOL_SIZE,
             max_overflow=settings.DATABASE_MAX_OVERFLOW,
             pool_pre_ping=True,  # 連接前檢查

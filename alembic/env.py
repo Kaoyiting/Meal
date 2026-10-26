@@ -8,7 +8,7 @@ import asyncio
 import logging
 from logging.config import fileConfig
 
-from sqlalchemy import pool, create_engine
+from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -19,9 +19,12 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.config import get_settings
+from app.config import get_async_database_url, get_settings
 from app.database import Base
-from app.models import Order, OrderItem, Outbox, SagaStep  # Ensure all models are loaded
+from app.models import (
+    Order, OrderItem, Outbox, SagaStep, InventoryStock, InventoryMovement,
+    User, Menu, MenuItem,
+)  # Ensure all models are loaded
 
 # Read Alembic configuration
 config = context.config
@@ -38,10 +41,12 @@ target_metadata = Base.metadata
 def get_database_url():
     """Get database connection URL"""
     settings = get_settings()
-    # Use sync version of database URL for migrations
-    sync_url = settings.DATABASE_URL.replace("+asyncpg", "")
-    logger.info(f"Using database URL: {sync_url.split('@')[1] if '@' in sync_url else sync_url}")
-    return sync_url
+    database_url = get_async_database_url(settings.DATABASE_URL)
+    logger.info(
+        "Using database URL: %s",
+        database_url.split("@", 1)[1] if "@" in database_url else database_url,
+    )
+    return database_url
 
 def run_migrations_offline() -> None:
     """
@@ -101,7 +106,7 @@ async def run_async_migrations() -> None:
     
     Use async engine for migration operations
     """
-    # Create async engine configuration
+    # Create async engine configuration so Docker only needs asyncpg.
     configuration = config.get_section(config.config_ini_section)
     configuration["sqlalchemy.url"] = get_database_url()
     
@@ -123,21 +128,14 @@ def run_migrations_online() -> None:
     
     This mode requires actual database connection
     """
-    # Override database URL in config
-    config.set_main_option("sqlalchemy.url", get_database_url())
-    
     connectable = context.config.attributes.get("connection", None)
 
-    if connectable is None:
-        # Create sync engine for migrations
-        connectable = create_engine(
-            get_database_url(),
-            poolclass=pool.NullPool,  # Migrations don't need connection pool
-        )
+    if connectable is not None:
+        with connectable.connect() as connection:
+            do_run_migrations(connection)
+        return
 
-    # For sync engine, run migrations directly
-    with connectable.connect() as connection:
-        do_run_migrations(connection)
+    asyncio.run(run_async_migrations())
 
 
 # Choose appropriate migration mode based on context

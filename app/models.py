@@ -20,11 +20,13 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Identity,
     Integer,
     String,
     Text,
     CheckConstraint,
-    Index
+    Index,
+    UniqueConstraint,
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import relationship, Mapped
@@ -49,6 +51,93 @@ class SagaStepState(str, Enum):
     DONE = "DONE"                # 步驟執行成功
     COMPENSATED = "COMPENSATED"   # 步驟已執行補償動作
     FAILED = "FAILED"            # 步驟執行失敗，無法補償
+
+
+class UserRole(str, Enum):
+    EMPLOYEE = "employee"
+    ADMIN = "admin"
+
+
+class User(Base):
+    """可登入的使用者；角色由資料庫決定，不從註冊請求接受。"""
+    __tablename__ = "users"
+
+    id: Mapped[int] = Column(BigInteger, Identity(), primary_key=True)
+    username: Mapped[str] = Column(String(50), nullable=False)
+    password_hash: Mapped[str] = Column(String(255), nullable=False)
+    role: Mapped[str] = Column(String(20), nullable=False, default=UserRole.EMPLOYEE.value)
+    is_active: Mapped[bool] = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("role IN ('employee', 'admin')", name="chk_users_role"),
+        UniqueConstraint("username", name="uq_users_username"),
+        Index("idx_users_role", "role"),
+    )
+
+
+class Menu(Base):
+    """菜單資料與有效期間。"""
+    __tablename__ = "menus"
+
+    id: Mapped[int] = Column(BigInteger, Identity(), primary_key=True)
+    name: Mapped[str] = Column(String(100), nullable=False)
+    is_active: Mapped[bool] = Column(Boolean, nullable=False, default=True, server_default="true")
+    available_from: Mapped[Optional[datetime]] = Column(DateTime(timezone=True), nullable=True)
+    available_until: Mapped[Optional[datetime]] = Column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    items: Mapped[List["MenuItem"]] = relationship(
+        "MenuItem", back_populates="menu", lazy="selectin"
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "available_until IS NULL OR available_from IS NULL OR available_until > available_from",
+            name="chk_menus_valid_period",
+        ),
+    )
+
+
+class MenuItem(Base):
+    """菜單餐點；下架採軟停用，保留訂單歷史參照。"""
+    __tablename__ = "menu_items"
+
+    id: Mapped[int] = Column(BigInteger, Identity(), primary_key=True)
+    menu_id: Mapped[int] = Column(
+        BigInteger, ForeignKey("menus.id", ondelete="RESTRICT"), nullable=False
+    )
+    name: Mapped[str] = Column(String(100), nullable=False)
+    category: Mapped[str] = Column(String(50), nullable=False)
+    price: Mapped[int] = Column(Integer, nullable=False)
+    is_active: Mapped[bool] = Column(Boolean, nullable=False, default=True, server_default="true")
+    available_from: Mapped[Optional[datetime]] = Column(DateTime(timezone=True), nullable=True)
+    available_until: Mapped[Optional[datetime]] = Column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    menu: Mapped[Menu] = relationship("Menu", back_populates="items")
+
+    __table_args__ = (
+        CheckConstraint("price > 0", name="chk_menu_items_price_positive"),
+        CheckConstraint(
+            "available_until IS NULL OR available_from IS NULL OR available_until > available_from",
+            name="chk_menu_items_valid_period",
+        ),
+        UniqueConstraint("menu_id", "name", name="uq_menu_items_menu_name"),
+        Index("idx_menu_items_menu_active", "menu_id", "is_active"),
+    )
 
 
 class Order(Base):
@@ -312,6 +401,55 @@ class Outbox(Base):
 
     def __repr__(self) -> str:
         return f"<Outbox(id={self.id}, event_type={self.event_type}, published={self.published})>"
+
+
+class InventoryStock(Base):
+    """目前可售庫存；menu_item_id 由 Menu Service 管理。"""
+    __tablename__ = "inventory_stocks"
+
+    menu_item_id: Mapped[int] = Column(BigInteger, primary_key=True)
+    available_quantity: Mapped[int] = Column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("available_quantity >= 0", name="chk_inventory_quantity_non_negative"),
+    )
+
+
+class InventoryMovement(Base):
+    """庫存異動帳本；負數為下單扣庫存，正數為補貨或取消回補。"""
+    __tablename__ = "inventory_movements"
+
+    id: Mapped[uuid.UUID] = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    menu_item_id: Mapped[int] = Column(
+        BigInteger, ForeignKey("inventory_stocks.menu_item_id", ondelete="RESTRICT"), nullable=False
+    )
+    order_id: Mapped[Optional[uuid.UUID]] = Column(
+        UUID(as_uuid=True), ForeignKey("orders.id", ondelete="SET NULL"), nullable=True
+    )
+    quantity_delta: Mapped[int] = Column(Integer, nullable=False)
+    reason: Mapped[str] = Column(String(30), nullable=False)
+    created_at: Mapped[datetime] = Column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        CheckConstraint("quantity_delta <> 0", name="chk_inventory_movement_nonzero"),
+        CheckConstraint(
+            "(reason = 'ORDER_PLACED' AND quantity_delta < 0) OR "
+            "(reason IN ('RESTOCK', 'ORDER_CANCELLED') AND quantity_delta > 0)",
+            name="chk_inventory_movement_reason_sign",
+        ),
+        Index("idx_inventory_movements_item_created", "menu_item_id", "created_at"),
+        Index("idx_inventory_movements_order", "order_id"),
+    )
 
 
 class SagaStep(Base):

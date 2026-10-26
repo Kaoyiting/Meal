@@ -1,168 +1,77 @@
 services:
-  # Order Service 應用程式
-  order-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: order-service
-    ports:
-      - "8000:8000"  # 對外埠 8000，使用標準端口
+  app:
+    build: .
     environment:
-      # 應用程式設定
-      - ENVIRONMENT=development
-      - DEBUG=true
-      - API_V1_STR=/api/v1
-      - PROJECT_NAME=Order Service
-      
-      # JWT 設定
-      - SECRET_KEY=your-super-secret-key-change-in-production
-      - JWT_SECRET_KEY=your-jwt-secret-key-change-in-production
-      - JWT_ALGORITHM=HS256
-      - JWT_EXPIRE_HOURS=24
-      
-      # 資料庫設定 (連接到容器內的 PostgreSQL)
-      - DATABASE_URL=postgresql+asyncpg://order_user:order_password@postgres:5432/order_service
-      - DATABASE_POOL_SIZE=20
-      - DATABASE_MAX_OVERFLOW=30
-      
-      # Redis 設定 (連接到容器內的 Redis)
-      - REDIS_URL=redis://redis:6379/0
-      - REDIS_PASSWORD=
-      - REDIS_DB=0
-      
-      # RabbitMQ 設定 (連接到容器內的 RabbitMQ)
-      - RABBITMQ_URL=amqp://order_user:order_password@rabbitmq:5672/order_vhost
+      ENVIRONMENT: development
+      DEBUG: "false"
+      PROJECT_NAME: Meal Order API
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-order_user}:${POSTGRES_PASSWORD:-order_password}@postgres:5432/${POSTGRES_DB:-order_service}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:?Set JWT_SECRET_KEY in .env}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      JWT_EXPIRE_HOURS: ${JWT_EXPIRE_HOURS:-24}
+      DATABASE_POOL_SIZE: ${DATABASE_POOL_SIZE:-10}
+      DATABASE_MAX_OVERFLOW: ${DATABASE_MAX_OVERFLOW:-20}
+    command: ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+    ports:
+      - "${APP_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
-    networks:
-      - order-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health')"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 40s
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 15s
+      timeout: 8s
+      retries: 5
+      start_period: 30s
 
-  # PostgreSQL 資料庫
   postgres:
     image: postgres:15-alpine
-    container_name: order-postgres
     environment:
-      - POSTGRES_DB=order_service
-      - POSTGRES_USER=order_user
-      - POSTGRES_PASSWORD=order_password
-      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+      POSTGRES_DB: ${POSTGRES_DB:-order_service}
+      POSTGRES_USER: ${POSTGRES_USER:-order_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-order_password}
     ports:
-      - "5433:5432"  # 對外埠 5433，避免與主機 PostgreSQL 衝突
+      - "${POSTGRES_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro  # 初始化腳本
-    networks:
-      - order-network
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U order_user -d order_service"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
 
-  # Redis 快取
   redis:
     image: redis:7-alpine
-    container_name: order-redis
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "6380:6379"  # 對外埠 6380，避免與主機 Redis 衝突
+      - "${REDIS_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
-    networks:
-      - order-network
-    restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
+      interval: 5s
       timeout: 3s
-      retries: 5
-      start_period: 10s
+      retries: 10
 
-  # RabbitMQ 訊息佇列
-  rabbitmq:
-    image: rabbitmq:3-management-alpine
-    container_name: order-rabbitmq
+  test-postgres:
+    image: postgres:15-alpine
+    profiles: ["test"]
     environment:
-      - RABBITMQ_DEFAULT_USER=order_user
-      - RABBITMQ_DEFAULT_PASS=order_password
-      - RABBITMQ_DEFAULT_VHOST=order_vhost
+      POSTGRES_DB: test_order_service
+      POSTGRES_USER: test_user
+      POSTGRES_PASSWORD: test_password
     ports:
-      - "5673:5672"   # AMQP 協定埠
-      - "15673:15672" # 管理介面埠
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
-    networks:
-      - order-network
-    restart: unless-stopped
+      - "5434:5432"
     healthcheck:
-      test: rabbitmq-diagnostics -q ping
-      interval: 30s
-      timeout: 30s
-      retries: 3
-      start_period: 60s
+      test: ["CMD-SHELL", "pg_isready -U test_user -d test_order_service"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
-  # pgAdmin - PostgreSQL 圖形化管理工具
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: order-pgadmin
-    environment:
-      - PGADMIN_DEFAULT_EMAIL=admin@example.com
-      - PGADMIN_DEFAULT_PASSWORD=admin123
-      - PGADMIN_CONFIG_ENHANCED_COOKIE_PROTECTION=False
-    ports:
-      - "5050:80"  # pgAdmin 網頁介面
-    volumes:
-      - pgadmin_data:/var/lib/pgadmin
-    depends_on:
-      - postgres
-    networks:
-      - order-network
-    restart: unless-stopped
-
-  # Alembic 資料庫遷移 (僅在需要時執行)
-  migration:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: order-migration
-    environment:
-      - DATABASE_URL=postgresql+asyncpg://order_user:order_password@postgres:5432/order_service
-    command: ["alembic", "upgrade", "head"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-    networks:
-      - order-network
-    profiles:
-      - migration  # 只有在指定 profile 時才啟動
-
-# 網路設定
-networks:
-  order-network:
-    driver: bridge
-    name: order-network
-
-# 資料持久化
 volumes:
   postgres_data:
-    name: order_postgres_data
   redis_data:
-    name: order_redis_data
-  rabbitmq_data:
-    name: order_rabbitmq_data
-  pgadmin_data:
-    name: order_pgadmin_data

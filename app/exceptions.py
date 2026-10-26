@@ -34,6 +34,28 @@ class BusinessLogicError(OrderServiceException):
         )
 
 
+class InsufficientInventoryError(OrderServiceException):
+    """庫存不存在或數量不足。"""
+
+    def __init__(self, menu_item_id: int):
+        super().__init__(
+            message=f"餐點 {menu_item_id} 庫存不足或尚未設定",
+            error_code="INSUFFICIENT_INVENTORY",
+            details={"menu_item_id": menu_item_id},
+        )
+
+
+class InventoryReservationError(OrderServiceException):
+    """訂單庫存扣減帳本與訂單明細不一致。"""
+
+    def __init__(self, order_id: str):
+        super().__init__(
+            message=f"訂單 {order_id} 的庫存異動紀錄不完整，無法安全回補",
+            error_code="INVENTORY_RESERVATION_ERROR",
+            details={"order_id": order_id},
+        )
+
+
 class DatabaseError(OrderServiceException):
     """資料庫操作錯誤"""
     
@@ -220,9 +242,11 @@ def to_http_exception(error: OrderServiceException) -> HTTPException:
         "AUTHORIZATION_ERROR": status.HTTP_403_FORBIDDEN,
         "RESOURCE_NOT_FOUND": status.HTTP_404_NOT_FOUND,
         "ORDER_NOT_FOUND": status.HTTP_404_NOT_FOUND,
-        "INVALID_ORDER_STATUS": status.HTTP_400_BAD_REQUEST,
-        "CANCELLATION_TIME_EXPIRED": status.HTTP_400_BAD_REQUEST,
+        "INVALID_ORDER_STATUS": status.HTTP_409_CONFLICT,
+        "CANCELLATION_TIME_EXPIRED": status.HTTP_409_CONFLICT,
         "BUSINESS_LOGIC_ERROR": status.HTTP_400_BAD_REQUEST,
+        "INSUFFICIENT_INVENTORY": status.HTTP_409_CONFLICT,
+        "INVENTORY_RESERVATION_ERROR": status.HTTP_409_CONFLICT,
         "DATABASE_ERROR": status.HTTP_500_INTERNAL_SERVER_ERROR,
         "EXTERNAL_SERVICE_ERROR": status.HTTP_503_SERVICE_UNAVAILABLE,
         "SAGA_EXECUTION_ERROR": status.HTTP_500_INTERNAL_SERVER_ERROR,

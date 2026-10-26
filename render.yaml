@@ -1,0 +1,49 @@
+services:
+  - type: keyvalue
+    name: meal-order-mvp-redis
+    region: singapore
+    plan: free
+    maxmemoryPolicy: noeviction
+    persistenceMode: off
+    ipAllowList: []
+
+  - type: web
+    name: meal-order-mvp-api
+    runtime: docker
+    region: singapore
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: DEBUG
+        value: "false"
+      - key: LOG_FORMAT
+        value: json
+      - key: DATABASE_POOL_SIZE
+        value: "5"
+      - key: DATABASE_MAX_OVERFLOW
+        value: "5"
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        fromDatabase:
+          name: meal-order-mvp-db
+          property: connectionString
+      - key: REDIS_URL
+        fromService:
+          name: meal-order-mvp-redis
+          type: keyvalue
+          property: connectionString
+      - key: BACKEND_CORS_ORIGINS
+        value: "[]"
+
+databases:
+  - name: meal-order-mvp-db
+    databaseName: meal_order
+    user: meal_order_user
+    region: singapore
+    plan: free
+    postgresMajorVersion: 15

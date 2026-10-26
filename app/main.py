@@ -28,14 +28,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 # 應用程式模組導入
 from app.config import get_settings
 from app.database import get_db
-from app.auth import get_current_user_id, require_admin, get_current_user
+from app.auth import (
+    auth_service,
+    get_current_employee_id,
+    get_current_user,
+    get_current_user_id,
+    require_admin,
+)
 from app.services import OrderService
 from app.schemas import (
     OrderCreate, OrderResponse, OrderHistoryResponse,
     OrderCancelRequest, OrderStatistics, HealthCheckResponse,
-    MonthlySummary, UserOrderHistoryResponse
+    MonthlySummary, UserOrderHistoryResponse, InventoryRestockRequest,
+    InventoryStockResponse, InventoryMovementResponse,
+    UserRegisterRequest, UserLoginRequest, UserResponse, AuthTokenResponse,
 )
 from app.exceptions import OrderServiceException
+from app.inventory_service import InventoryService
+from app.models import MenuItem
+from app.user_service import UserService
+from app.menu_api import router as menu_router
 
 # 設定日誌
 logger = logging.getLogger(__name__)
@@ -64,6 +76,7 @@ app = FastAPI(
         }
     ]
 )
+app.include_router(menu_router)
 
 # === 2. 應用程式生命週期事件 ===
 @app.on_event("startup")
@@ -102,13 +115,12 @@ async def shutdown_event():
 # === 3. CORS 中介軟體設定 ===
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",    # React 開發環境
-        "http://localhost:8080",    # Vue 開發環境
-        "http://localhost:5173",    # Vite 開發環境
-    ],
+    allow_origins=list(dict.fromkeys(
+        settings.BACKEND_CORS_ORIGINS
+        + ([settings.FRONTEND_URL.rstrip("/")] if settings.FRONTEND_URL else [])
+    )),
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -122,8 +134,10 @@ async def handle_order_exception(request, exc: OrderServiceException):
         "VALIDATION_ERROR": status.HTTP_422_UNPROCESSABLE_ENTITY,
         "MENU_VALIDATION_ERROR": status.HTTP_422_UNPROCESSABLE_ENTITY,
         "ORDER_NOT_FOUND": status.HTTP_404_NOT_FOUND,
-        "INVALID_ORDER_STATUS": status.HTTP_400_BAD_REQUEST,
-        "CANCELLATION_TIME_EXPIRED": status.HTTP_400_BAD_REQUEST,
+        "INVALID_ORDER_STATUS": status.HTTP_409_CONFLICT,
+        "CANCELLATION_TIME_EXPIRED": status.HTTP_409_CONFLICT,
+        "INSUFFICIENT_INVENTORY": status.HTTP_409_CONFLICT,
+        "INVENTORY_RESERVATION_ERROR": status.HTTP_409_CONFLICT,
         "AUTHENTICATION_ERROR": status.HTTP_401_UNAUTHORIZED,
         "AUTHORIZATION_ERROR": status.HTTP_403_FORBIDDEN,
         "BUSINESS_LOGIC_ERROR": status.HTTP_400_BAD_REQUEST,
@@ -179,6 +193,32 @@ async def health_check():
             timestamp=datetime.utcnow()
         )
 
+
+@app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED, tags=["auth"])
+async def register_employee(
+    request: UserRegisterRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """公開註冊只建立員工；角色不接受用戶端指定。"""
+    user = await UserService(db).register_employee(request)
+    return UserResponse.model_validate(user)
+
+
+@app.post("/auth/login", response_model=AuthTokenResponse, tags=["auth"])
+async def login(
+    request: UserLoginRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    user = await UserService(db).authenticate(request.username, request.password)
+    token = auth_service.create_access_token(user.id)
+    return AuthTokenResponse(access_token=token, user=UserResponse.model_validate(user))
+
+
+@app.get("/auth/me", response_model=UserResponse, tags=["auth"])
+async def read_current_user(current_user: dict = Depends(get_current_user)):
+    """回傳 token 對應的資料庫使用者與角色。"""
+    return current_user
+
 # === 6. 核心業務端點 ===
 
 @app.post(
@@ -191,7 +231,7 @@ async def health_check():
 )
 async def create_order(
     request: OrderCreate,
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_employee_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -244,7 +284,7 @@ async def get_order_history(
         le=100, 
         description="每頁筆數 (最大100)"
     ),
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_employee_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -355,8 +395,7 @@ async def get_user_order_history(
     # 權限檢查：員工只能查自己，管理員可查任意用戶
     current_user_id = current_user["user_id"]
     
-    # 簡化的管理員檢查：user_id=1 是管理員
-    is_admin = (current_user_id == 1)
+    is_admin = current_user["role"] == "admin"
     
     if not is_admin and current_user_id != user_id:
         raise HTTPException(
@@ -386,7 +425,7 @@ async def get_user_order_history(
 )
 async def get_order_detail(
     order_id: uuid.UUID = Path(..., description="訂單ID"),
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_employee_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -413,7 +452,7 @@ async def get_order_detail(
 async def cancel_order(
     request: OrderCancelRequest,
     order_id: uuid.UUID = Path(..., description="訂單ID"),
-    user_id: int = Depends(get_current_user_id),
+    user_id: int = Depends(get_current_employee_id),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -483,80 +522,105 @@ async def get_order_statistics(
     return result
 
 
-# === 8. 測試專用端點（無需認證） ===
+@app.post(
+    "/admin/orders/{order_id}/complete",
+    response_model=OrderResponse,
+    tags=["orders"],
+    summary="標記訂單完成",
+)
+async def complete_order(
+    order_id: uuid.UUID = Path(..., description="訂單ID"),
+    admin_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    logger.info("管理員 %s 完成訂單 %s", admin_user["user_id"], order_id)
+    return await OrderService(db).complete_order(order_id)
+
 
 @app.get(
-    "/test/orders/{order_id}",
-    tags=["testing"],
-    summary="測試用查詢單筆訂單（無需認證）",
-    description="僅供測試使用的訂單查詢端點，無需 JWT 認證"
+    "/inventory/{menu_item_id}",
+    response_model=InventoryStockResponse,
+    tags=["inventory"],
+    summary="查詢餐點庫存",
 )
-async def test_get_order_detail(
-    order_id: uuid.UUID = Path(..., description="訂單ID"),
-    db: AsyncSession = Depends(get_db)
+async def get_inventory_stock(
+    menu_item_id: int = Path(..., gt=0),
+    user_id: int = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
 ):
-    """
-    測試用訂單查詢端點（無需認證）
-    
-    - 用於測試 API 功能
-    - 不檢查用戶權限
-    - 回傳完整的訂單資訊
-    """
-    logger.info(f"🧪 測試查詢訂單 {order_id}")
-    
+    del user_id  # JWT 驗證即代表此查詢需要登入。
+    menu_item = await db.get(MenuItem, menu_item_id)
+    if menu_item is None:
+        raise HTTPException(status_code=404, detail="餐點不存在")
+    stock = await InventoryService(db).get_stock(menu_item_id)
+    return InventoryStockResponse(
+        menu_item_id=menu_item_id,
+        menu_item_name=menu_item.name,
+        available_quantity=stock.available_quantity if stock else 0,
+        updated_at=stock.updated_at if stock else None,
+    )
+
+
+@app.post(
+    "/admin/inventory/{menu_item_id}/restock",
+    response_model=InventoryStockResponse,
+    status_code=status.HTTP_200_OK,
+    tags=["inventory"],
+    summary="補充餐點庫存",
+)
+async def restock_inventory(
+    request: InventoryRestockRequest,
+    menu_item_id: int = Path(..., gt=0),
+    admin_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    menu_item = await db.get(MenuItem, menu_item_id)
+    if menu_item is None:
+        raise HTTPException(status_code=404, detail="餐點不存在")
     try:
-        # 直接查詢資料庫，不經過 Service 層的用戶權限檢查
-        from sqlalchemy import select
-        from app.models import Order, OrderItem
-        
-        # 查詢訂單基本資訊
-        stmt = select(Order).where(Order.id == order_id)
-        result = await db.execute(stmt)
-        order = result.scalar_one_or_none()
-        
-        if not order:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"訂單 {order_id} 不存在"
-            )
-        
-        # 查詢訂單項目
-        items_stmt = select(OrderItem).where(OrderItem.order_id == order_id)
-        items_result = await db.execute(items_stmt)
-        items = items_result.scalars().all()
-        
-        # 組裝回應資料
-        return {
-            "order_id": str(order.id),
-            "user_id": order.user_id,
-            "menu_id": order.menu_id,
-            "total_amount": order.total_amount,
-            "status": order.status,
-            "notes": order.notes,
-            "order_date": order.order_date.isoformat() if order.order_date else None,
-            "created_at": order.created_at.isoformat() if order.created_at else None,
-            "updated_at": order.updated_at.isoformat() if order.updated_at else None,
-            "items_count": len(items),
-            "items": [
-                {
-                    "item_id": str(item.id),
-                    "product_id": item.product_id,
-                    "quantity": item.quantity,
-                    "unit_price": item.unit_price,
-                    "subtotal": item.subtotal
-                }
-                for item in items
-            ]
-        }
-        
-    except HTTPException:
+        stock = await InventoryService(db).restock(menu_item_id, request.quantity)
+        await db.commit()
+    except Exception:
+        await db.rollback()
         raise
-    except Exception as e:
-        logger.error(f"❌ 測試查詢訂單失敗: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"查詢訂單時發生錯誤: {str(e)}"
+    logger.info("管理員 %s 補貨 item=%s quantity=%s", admin_user["user_id"], menu_item_id, request.quantity)
+    return InventoryStockResponse(
+        menu_item_id=menu_item_id,
+        menu_item_name=menu_item.name,
+        available_quantity=stock.available_quantity,
+        updated_at=stock.updated_at,
+    )
+
+
+@app.get(
+    "/admin/inventory/{menu_item_id}/movements",
+    response_model=list[InventoryMovementResponse],
+    tags=["inventory"],
+    summary="查詢庫存異動紀錄",
+)
+async def get_inventory_movements(
+    menu_item_id: int = Path(..., gt=0),
+    limit: int = Query(100, ge=1, le=500),
+    admin_user: dict = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    del admin_user
+    menu_item = await db.get(MenuItem, menu_item_id)
+    if menu_item is None:
+        raise HTTPException(status_code=404, detail="餐點不存在")
+    movements = await InventoryService(db).list_movements(menu_item_id, limit)
+    return [
+        InventoryMovementResponse(
+            id=movement.id,
+            menu_item_id=movement.menu_item_id,
+            menu_item_name=menu_item.name,
+            quantity_delta=movement.quantity_delta,
+            reason=movement.reason,
+            order_id=movement.order_id,
+            created_at=movement.created_at,
         )
+        for movement in movements
+    ]
 
 
 # === 完成！所有端點已實現 ===
@@ -568,4 +632,5 @@ async def test_get_order_detail(
 # ✅ GET  /orders/statistics   - 查詢統計（管理員）
 # ✅ GET  /orders/summary      - 月底結帳總和（管理員，報表專用）
 # ✅ GET  /orders/user/{userId} - 查詢用戶訂單記錄（報表專用）
-# 🧪 GET  /test/orders/{id}    - 測試用查詢訂單（無認證）
+# ✅ GET  /inventory/{menu_item_id} - 查詢庫存
+# ✅ POST /admin/inventory/{menu_item_id}/restock - 管理員補貨

@@ -5,19 +5,23 @@ Order Service JWT 認證模組
 用於 FastAPI 依賴注入系統
 """
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 from jose import jwt
 from fastapi import HTTPException, status, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
+from app.database import get_db
+from app.models import User, UserRole
 
 logger = logging.getLogger(__name__)
 
 # FastAPI HTTP Bearer token scheme
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 class AuthService:
@@ -45,14 +49,17 @@ class AuthService:
             str: JWT token 字串
         """
         # 基本 payload
+        now = datetime.now(timezone.utc)
         payload = {
             "user_id": user_id,
-            "iat": datetime.utcnow(),
-            "exp": datetime.utcnow() + timedelta(hours=self.expire_hours)
+            "iat": now,
+            "exp": now + timedelta(hours=self.expire_hours),
         }
         
         # 加入額外的 claims
         if additional_claims:
+            if {"user_id", "iat", "exp"}.intersection(additional_claims):
+                raise ValueError("additional_claims 不可覆寫 user_id、iat 或 exp")
             payload.update(additional_claims)
         
         token = jwt.encode(payload, self.secret_key, algorithm=self.algorithm)
@@ -82,10 +89,10 @@ class AuthService:
             
             # 檢查必要欄位
             user_id = payload.get("user_id")
-            if user_id is None:
+            if not isinstance(user_id, int) or user_id <= 0:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Token 缺少 user_id"
+                    detail="Token 的 user_id 無效"
                 )
             
             logger.debug(f"🔓 JWT token 驗證成功: user_id={user_id}")
@@ -122,8 +129,9 @@ class AuthService:
 auth_service = AuthService()
 
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
+async def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    db: AsyncSession = Depends(get_db),
 ) -> Dict[str, Any]:
     """
     FastAPI 依賴注入函式：取得當前用戶資訊
@@ -142,27 +150,41 @@ def get_current_user(
     Raises:
         HTTPException: 認證失敗
     """
-    try:
-        token = credentials.credentials
-        payload = auth_service.verify_token(token)
-        
-        # 回傳用戶資訊
-        return {
-            "user_id": payload["user_id"],
-            "token_data": payload
-        }
-    except Exception as e:
-        logger.error(f"🔒 認證失敗: {e}")
+    if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="認證失敗",
-            headers={"WWW-Authenticate": "Bearer"}
+            detail="請提供 Bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    try:
+        payload = auth_service.verify_token(credentials.credentials)
+    except HTTPException:
+        raise
+
+    user = await db.scalar(
+        select(User).where(
+            User.id == payload["user_id"],
+            User.is_active.is_(True),
+        )
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="使用者不存在或已停用",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return {
+        "id": user.id,
+        "user_id": user.id,
+        "username": user.username,
+        "role": user.role,
+        "is_active": user.is_active,
+        "created_at": user.created_at,
+        "token_data": payload,
+    }
 
 
-def get_current_user_id(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-) -> int:
+def get_current_user_id(current_user: Dict[str, Any] = Depends(get_current_user)) -> int:
     """
     FastAPI 依賴注入函式：取得當前用戶ID（簡化版）
     
@@ -177,8 +199,7 @@ def get_current_user_id(
     Returns:
         int: 用戶ID
     """
-    user = get_current_user(credentials)
-    return user["user_id"]
+    return current_user["user_id"]
 
 
 def create_test_token(user_id: int = 123) -> str:
@@ -204,9 +225,6 @@ def require_admin(
     """
     要求管理員權限的依賴注入函式
     
-    注意：這是簡化版本，實際的權限控制需要從資料庫查詢用戶角色
-    目前假設 user_id == 1 的是管理員
-    
     Args:
         current_user: 當前用戶資訊
         
@@ -217,17 +235,32 @@ def require_admin(
         HTTPException: 權限不足
     """
     user_id = current_user["user_id"]
-    
-    # 簡化的管理員檢查邏輯
-    if user_id != 1:  # 假設 user_id=1 是管理員
-        logger.warning(f"🚫 用戶 {user_id} 嘗試存取管理員功能")
+    if current_user["role"] != UserRole.ADMIN.value:
+        logger.warning("使用者 %s 嘗試存取管理員功能", user_id)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="需要管理員權限"
         )
-    
-    logger.info(f"👨‍💼 管理員 {user_id} 存取授權")
+    logger.info("管理員 %s 存取授權", user_id)
     return current_user
+
+
+def require_employee(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """要求員工角色；管理員 API 則使用 require_admin。"""
+    if current_user["role"] != UserRole.EMPLOYEE.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="此功能僅限員工使用",
+        )
+    return current_user
+
+
+def get_current_employee_id(
+    employee: Dict[str, Any] = Depends(require_employee),
+) -> int:
+    return employee["user_id"]
 
 
 # 工具函式

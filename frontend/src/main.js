@@ -1,0 +1,15 @@
+import { createApp } from 'vue';
+import { createRouter, createWebHashHistory } from 'vue-router';
+import App from './App.vue';
+import HomePage from './components/HomePage.vue';
+import StorePage from './components/StorePage.vue';
+import OrdersPage from './components/OrdersPage.vue';
+import AdminPage from './components/AdminPage.vue';
+import { state } from './state.js';
+import './styles.css';
+import './stores.css';
+import './vue.css';
+import './interface.css';
+const router=createRouter({history:createWebHashHistory(),routes:[{path:'/',component:HomePage},{path:'/stores/:id',component:StorePage},{path:'/orders',component:OrdersPage},{path:'/admin',component:AdminPage},{path:'/:pathMatch(.*)*',redirect:'/'}],scrollBehavior:()=>({top:0})});
+router.afterEach(to=>{const store=state.menus.find(s=>String(s.id)===to.params.id);document.title=store?`${store.name}｜Meal`:to.path==='/orders'?'我的訂單｜Meal':to.path==='/admin'?'菜單與庫存｜Meal':'Meal｜好好吃飯';});
+createApp(App).use(router).mount('#app');

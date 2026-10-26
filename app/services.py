@@ -11,27 +11,27 @@ Order Service 業務邏輯層
 """
 import uuid
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, and_, desc, func
+from sqlalchemy import select, update, and_, desc, func, or_
 from sqlalchemy.orm import selectinload
 
-from app.models import Order, OrderItem, SagaStep, OrderStatus, SagaStepState
+from app.models import Menu, MenuItem, Order, OrderItem, OrderStatus
 from app.schemas import (
     OrderCreate, OrderResponse, OrderItemResponse, 
     OrderCancelRequest, OrderHistoryResponse, OrderStatistics,
     MonthlySummary, UserOrderHistoryResponse
 )
 from app.exceptions import (
-    BusinessLogicError, 
     InvalidOrderStatusError,
     OrderNotFoundError,
     ValidationError,
     CancellationTimeExpiredError
 )
-from app.menu_service import menu_service
+from app.inventory_service import InventoryService
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +51,10 @@ class OrderService:
         建立新訂單
         
         流程:
-        1. 驗證前端計算的總金額
-        2. 建立訂單記錄
-        3. 模擬發布庫存扣減事件（日誌）
-        4. 建立 Saga 追蹤記錄
+        1. 從資料庫菜單驗證餐點並計算價格
+        2. 在同一交易建立訂單與明細
+        3. 原子扣減庫存並記錄異動
+        4. 任一步驟失敗時回滾整筆交易
         
         Args:
             request: 訂單建立請求
@@ -64,44 +64,42 @@ class OrderService:
             OrderResponse: 建立的訂單資訊
             
         Raises:
-            ValidationError: 總金額不符
-            BusinessLogicError: 業務邏輯錯誤
+            ValidationError: 菜單或餐點無效
         """
-        # 1. 菜單驗證：驗證菜單ID和所有餐點資訊
-        logger.info(f"🔍 開始驗證菜單ID {request.menu_id} 和餐點資訊")
-        
-        # 驗證菜單ID存在
-        if not menu_service.validate_menu_exists(request.menu_id):
-            raise ValidationError(f"無效的菜單ID: {request.menu_id}，該菜單不存在")
-        
-        menu_name = menu_service.get_menu_name(request.menu_id)
-        logger.info(f"📋 驗證菜單：{menu_name} (ID: {request.menu_id})")
-        
-        # 逐項驗證每個餐點
-        for item in request.items:
-            menu_service.validate_order_item(
-                menu_id=request.menu_id,
-                menu_item_id=item.menu_item_id,
-                menu_item_name=item.menu_item_name,
-                unit_price=item.unit_price
+        # 用資料庫中的有效菜單作為唯一價格來源；request 只提供 ID 和數量。
+        now = datetime.now(timezone.utc)
+        menu_statement = (
+            select(Menu)
+            .where(
+                Menu.id == request.menu_id,
+                Menu.is_active.is_(True),
+                or_(Menu.available_from.is_(None), Menu.available_from <= now),
+                or_(Menu.available_until.is_(None), Menu.available_until > now),
             )
-        
-        logger.info(f"✅ 菜單驗證完成，共驗證 {len(request.items)} 個餐點")
-        
-        # 2. 計算實際總金額並驗證
-        calculated_total = sum(
-            item.quantity * item.unit_price for item in request.items
+            .options(selectinload(Menu.items.and_(
+                MenuItem.is_active.is_(True),
+                or_(MenuItem.available_from.is_(None), MenuItem.available_from <= now),
+                or_(MenuItem.available_until.is_(None), MenuItem.available_until > now),
+            )))
         )
-        if calculated_total != request.expected_total:
-            raise ValidationError(
-                f"總金額驗證失敗：前端計算 {request.expected_total}元，"
-                f"後端計算 {calculated_total}元"
-            )
+        menu = await self.db.scalar(menu_statement)
+        if menu is None or not self._is_available(menu, now):
+            raise ValidationError(f"無效的菜單ID: {request.menu_id}，該菜單不存在")
 
-        # 建立訂單主記錄
+        menu_items_by_id = {
+            item.id: item for item in menu.items if self._is_available(item, now)
+        }
+        catalog_items = []
+        for item_req in request.items:
+            menu_item = menu_items_by_id.get(item_req.menu_item_id)
+            if menu_item is None:
+                raise ValidationError(
+                    f"餐點ID {item_req.menu_item_id} 不屬於菜單ID {request.menu_id}，或目前未開放"
+                )
+            catalog_items.append((item_req, menu_item))
+
+        calculated_total = sum(req.quantity * item.price for req, item in catalog_items)
         order_id = uuid.uuid4()
-        saga_id = uuid.uuid4()
-        
         order = Order(
             id=order_id,
             user_id=user_id,
@@ -109,41 +107,43 @@ class OrderService:
             total_amount=calculated_total,
             status=OrderStatus.PENDING,
             notes=request.notes,
-            order_date=date.today(),
-            saga_id=saga_id
+            order_date=datetime.now(ZoneInfo("Asia/Taipei")).date(),
+            saga_id=uuid.uuid4(),
+            version=1,
         )
-        
-        self.db.add(order)
+        try:
+            self.db.add(order)
+            order_items = []
+            for item_req, menu_item in catalog_items:
+                item = OrderItem(
+                    id=uuid.uuid4(),
+                    order_id=order_id,
+                    menu_item_id=item_req.menu_item_id,
+                    menu_item_name=menu_item.name,
+                    quantity=item_req.quantity,
+                    unit_price=menu_item.price,
+                )
+                order_items.append(item)
+                self.db.add(item)
 
-        # 建立訂單項目
-        order_items = []
-        for item_req in request.items:
-            item = OrderItem(
-                id=uuid.uuid4(),
-                order_id=order_id,
-                menu_item_id=item_req.menu_item_id,
-                menu_item_name=item_req.menu_item_name,
-                quantity=item_req.quantity,
-                unit_price=item_req.unit_price
-            )
-            order_items.append(item)
-            self.db.add(item)
+            await self.db.flush()
+            inventory = InventoryService(self.db)
+            for item in sorted(order_items, key=lambda current: current.menu_item_id):
+                await inventory.deduct_for_order(item.menu_item_id, item.quantity, order_id)
+            response = await self._build_order_response(order, order_items)
+            await self.db.commit()
+            return response
+        except Exception:
+            await self.db.rollback()
+            raise
 
-        # 模擬發布庫存扣減事件（用日誌代替實際 RabbitMQ）
-        await self._simulate_inventory_reserve_event(order, order_items)
-        
-        # 建立 Saga 追蹤
-        await self._create_saga_step(
-            saga_id=saga_id,
-            step_name="inventory_reserve",
-            state=SagaStepState.PENDING,
-            context={"order_id": str(order_id), "action": "reserve_inventory"}
+    @staticmethod
+    def _is_available(record, now: datetime) -> bool:
+        return (
+            record.is_active
+            and (record.available_from is None or record.available_from <= now)
+            and (record.available_until is None or record.available_until > now)
         )
-
-        await self.db.commit()
-
-        # 回傳訂單資訊
-        return await self._build_order_response(order, order_items)
 
     async def cancel_order(
         self, 
@@ -169,44 +169,85 @@ class OrderService:
             InvalidOrderStatusError: 訂單狀態不可取消
         """
         # 查詢訂單
-        order = await self._get_order_by_id(order_id, user_id)
+        order = await self._get_order_by_id_with_items(order_id, user_id)
         
-        # 檢查訂單是否在 10 分鐘時限內
+        # SQLite 測試資料或舊資料可能回傳 naive datetime，統一視為 UTC。
         current_time = datetime.now(timezone.utc)
-        time_limit = order.created_at + timedelta(minutes=10)
+        created_at = order.created_at
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        time_limit = created_at + timedelta(minutes=10)
         
         if current_time > time_limit:
             raise CancellationTimeExpiredError(
-                f"訂單建立已超過 10 分鐘，無法取消。建立時間: {order.created_at.strftime('%Y-%m-%d %H:%M:%S')}",
-                created_at=order.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+                f"訂單建立已超過 10 分鐘，無法取消。建立時間: {created_at.strftime('%Y-%m-%d %H:%M:%S')}",
+                created_at=created_at.strftime('%Y-%m-%d %H:%M:%S'),
                 time_limit_minutes=10
             )
         
         # 檢查狀態
         if order.status != OrderStatus.PENDING:
+            current_status = getattr(order.status, "value", order.status)
             raise InvalidOrderStatusError(
-                f"訂單狀態 {order.status.value} 無法取消"
+                f"訂單狀態 {current_status} 無法取消",
+                current_status=current_status,
             )
 
-        # 更新訂單狀態
-        order.status = OrderStatus.CANCELLED
-        order.cancellation_reason = request.cancellation_reason
-        order.version += 1  # 樂觀鎖
-
-        # 模擬發布取消事件（用日誌代替實際 RabbitMQ）
-        await self._simulate_order_cancelled_event(order)
-
-        # 更新 Saga 步驟狀態
-        await self._update_saga_step_status(
-            order.saga_id,
-            "inventory_reserve",
-            SagaStepState.COMPENSATED
-        )
-
-        await self.db.commit()
+        try:
+            await InventoryService(self.db).restore_for_cancelled_order(order_id, order.items)
+            result = await self.db.execute(
+                update(Order)
+                .where(Order.id == order_id, Order.user_id == user_id, Order.status == OrderStatus.PENDING)
+                .values(
+                    status=OrderStatus.CANCELLED,
+                    cancellation_reason=request.cancellation_reason,
+                    version=Order.version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            if result.rowcount != 1:
+                raise InvalidOrderStatusError("訂單已被更新，無法重複取消")
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
 
         # 查詢完整訂單資訊回傳
         return await self.get_order_detail(order_id, user_id)
+
+    async def complete_order(self, order_id: uuid.UUID) -> OrderResponse:
+        """管理員確認出餐完成；已完成或已取消的訂單不可重複轉換。"""
+        stmt = select(Order).options(selectinload(Order.items)).where(Order.id == order_id)
+        result = await self.db.execute(stmt)
+        order = result.scalar_one_or_none()
+        if order is None:
+            raise OrderNotFoundError(f"訂單 {order_id} 不存在")
+        if order.status != OrderStatus.PENDING:
+            current_status = getattr(order.status, "value", order.status)
+            raise InvalidOrderStatusError(
+                f"訂單狀態 {current_status} 無法完成",
+                current_status=current_status,
+            )
+
+        try:
+            update_result = await self.db.execute(
+                update(Order)
+                .where(Order.id == order_id, Order.status == OrderStatus.PENDING)
+                .values(
+                    status=OrderStatus.COMPLETED,
+                    version=Order.version + 1,
+                    updated_at=datetime.now(timezone.utc),
+                )
+            )
+            if update_result.rowcount != 1:
+                raise InvalidOrderStatusError("訂單已被更新，無法重複完成")
+            order.status = OrderStatus.COMPLETED
+            order.version += 1
+            await self.db.commit()
+            return await self._build_order_response(order, order.items)
+        except Exception:
+            await self.db.rollback()
+            raise
 
     async def get_order_detail(
         self, 
@@ -678,161 +719,3 @@ class OrderService:
         # 這裡可以實現熱門餐點的統計邏輯
         # 暫時回傳空列表，實際應根據訂單項目統計
         return []
-
-    async def _simulate_inventory_reserve_event(
-        self, 
-        order: Order, 
-        items: List[OrderItem]
-    ) -> None:
-        """模擬發布庫存扣減事件（用日誌代替 RabbitMQ）"""
-        event_payload = {
-            "order_id": str(order.id),
-            "user_id": order.user_id,
-            "items": [
-                {
-                    "menu_item_id": item.menu_item_id,
-                    "quantity": item.quantity,
-                    "unit_price": item.unit_price
-                }
-                for item in items
-            ]
-        }
-        
-        logger.info(
-            f"🔄 模擬事件發布: inventory.reserve.requested | "
-            f"訂單: {order.id} | 項目數: {len(items)} | "
-            f"總金額: {order.total_amount}元"
-        )
-        logger.debug(f"事件內容: {event_payload}")
-
-    async def _simulate_order_cancelled_event(self, order: Order) -> None:
-        """模擬發布訂單取消事件（用日誌代替 RabbitMQ）"""
-        event_payload = {
-            "order_id": str(order.id),
-            "user_id": order.user_id,
-            "cancellation_reason": order.cancellation_reason,
-            "cancelled_at": datetime.now().isoformat()
-        }
-        
-        logger.info(
-            f"🔄 模擬事件發布: order.cancelled | "
-            f"訂單: {order.id} | 原因: {order.cancellation_reason}"
-        )
-        logger.debug(f"事件內容: {event_payload}")
-
-    async def _create_saga_step(
-        self,
-        saga_id: uuid.UUID,
-        step_name: str,
-        state: SagaStepState,
-        context: Dict
-    ) -> None:
-        """建立 Saga 步驟記錄"""
-        saga_step = SagaStep(
-            id=uuid.uuid4(),
-            saga_id=saga_id,
-            step=step_name,
-            state=state,
-            payload=context
-        )
-        
-        self.db.add(saga_step)
-        logger.info(f"📝 Saga 步驟記錄: {saga_id} -> {step_name} ({state.value})")
-
-    async def _update_saga_step_status(
-        self,
-        saga_id: uuid.UUID,
-        step_name: str,
-        new_state: SagaStepState
-    ) -> None:
-        """更新 Saga 步驟狀態"""
-        stmt = (
-            update(SagaStep)
-            .where(and_(
-                SagaStep.saga_id == saga_id,
-                SagaStep.step == step_name
-            ))
-            .values(state=new_state, updated_at=datetime.now())
-        )
-        
-        await self.db.execute(stmt)
-        logger.info(f"📝 Saga 步驟更新: {saga_id} -> {step_name} ({new_state.value})")
-
-
-class MockEventHandlerService:
-    """
-    模擬事件處理服務
-    
-    在實際的 RabbitMQ 整合完成前，用這個類別模擬外部事件回應
-    """
-
-    def __init__(self, db_session: AsyncSession):
-        self.db = db_session
-
-    async def simulate_inventory_reserved(
-        self, 
-        order_id: uuid.UUID, 
-        success: bool,
-        message: Optional[str] = None
-    ) -> None:
-        """
-        模擬庫存扣減完成事件
-        
-        Args:
-            order_id: 訂單ID
-            success: 是否成功
-            message: 結果訊息
-        """
-        logger.info(
-            f"🎭 模擬外部事件: inventory.reserved | "
-            f"訂單: {order_id} | 成功: {success} | 訊息: {message}"
-        )
-        
-        # 查詢訂單
-        stmt = select(Order).where(Order.id == order_id)
-        result = await self.db.execute(stmt)
-        order = result.scalar_one_or_none()
-        
-        if not order:
-            logger.warning(f"訂單 {order_id} 不存在，忽略事件")
-            return
-
-        if success:
-            # 庫存扣減成功，確認訂單
-            order.status = OrderStatus.INVENTORY_RESERVED
-            logger.info(f"✅ 訂單 {order_id} 庫存預留成功")
-        else:
-            # 庫存不足，取消訂單
-            order.status = OrderStatus.CANCELLED
-            order.cancellation_reason = message or "庫存不足"
-            logger.info(f"❌ 訂單 {order_id} 庫存預留失敗：{message}")
-
-        order.version += 1
-        
-        # 更新 Saga 步驟狀態
-        await self._update_saga_step_status(
-            order.saga_id,
-            "inventory_reserve",
-            SagaStepState.DONE if success else SagaStepState.FAILED
-        )
-
-        await self.db.commit()
-
-    async def _update_saga_step_status(
-        self,
-        saga_id: uuid.UUID,
-        step_name: str,
-        new_state: SagaStepState
-    ) -> None:
-        """更新 Saga 步驟狀態"""
-        stmt = (
-            update(SagaStep)
-            .where(and_(
-                SagaStep.saga_id == saga_id,
-                SagaStep.step == step_name
-            ))
-            .values(state=new_state, updated_at=datetime.now())
-        )
-        
-        await self.db.execute(stmt)
-        logger.info(f"📝 Saga 步驟更新: {saga_id} -> {step_name} ({new_state.value})")
